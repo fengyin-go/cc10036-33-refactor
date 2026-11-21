@@ -5,7 +5,12 @@ from typing import Any
 
 from app.services.base import BaseModuleService
 from app.store import store
-from app.analytics_engine import parse_segment_conditions, segment_population
+from app.analytics_engine import (
+    DecodedEvent,
+    decode_events,
+    parse_segment_conditions,
+    segment_population,
+)
 
 
 class SegmentRuleService(BaseModuleService):
@@ -35,8 +40,16 @@ class SegmentRuleService(BaseModuleService):
         include_conditions = parse_segment_conditions(include_expr)
         exclude_conditions = parse_segment_conditions(exclude_expr)
 
+        # 与同期群共用事件解码：同一来源的两种输入格式在此归一身份与时间字段。
+        # 非严格解码——单条时间失效不阻断会员信息圈选。
+        decoded_events = decode_events(population, strict=False)
+        filter_rows = [
+            _overlay_decoded_fields(row, decoded)
+            for row, decoded in zip(population, decoded_events)
+        ]
+
         matched, count = segment_population(
-            population, include_conditions, exclude_conditions, intersect_strategy,
+            filter_rows, include_conditions, exclude_conditions, intersect_strategy,
         )
 
         # 更新分群规模字段
@@ -89,6 +102,27 @@ class SegmentRuleService(BaseModuleService):
             _parse_int(row.get("分群规模"), 0) for row in segments
         )
         return base
+
+
+def _overlay_decoded_fields(
+    row: dict[str, Any], decoded: DecodedEvent,
+) -> dict[str, Any]:
+    """把解码出的身份/事件名/时间补到缺少标准字段的记录上（物理格式→标准字段）。
+
+    已含标准字段的记录原样返回，保证既有合法输入的筛选结果逐字节不变。
+    """
+    additions: dict[str, Any] = {}
+    if decoded.user_id and "user_id" not in row:
+        additions["user_id"] = decoded.user_id
+    if decoded.event_name and "event_name" not in row:
+        additions["event_name"] = decoded.event_name
+    if decoded.event_time is not None and "event_time" not in row:
+        additions["event_time"] = decoded.event_time
+    if not additions:
+        return row
+    merged = dict(row)
+    merged.update(additions)
+    return merged
 
 
 def _parse_int(val: Any, default: int) -> int:

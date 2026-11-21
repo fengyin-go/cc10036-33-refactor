@@ -5,7 +5,7 @@ from typing import Any
 
 from app.services.base import BaseModuleService
 from app.store import store
-from app.analytics_engine import compute_cohort_retention
+from app.analytics_engine import EventDecodeError, compute_cohort_retention
 
 
 class CohortAnalysisService(BaseModuleService):
@@ -42,9 +42,19 @@ class CohortAnalysisService(BaseModuleService):
         if retention_method == "bounded":
             max_periods = 12  # 有界保留
 
-        matrix = compute_cohort_retention(
-            events, init_event, return_event, period_days, max_periods,
-        )
+        try:
+            matrix = compute_cohort_retention(
+                events, init_event, return_event, period_days, max_periods,
+            )
+        except EventDecodeError as exc:
+            # 计算失败：不推进状态、不写半成品；调用方可持原始批次复跑，
+            # 失败批次的分子分母不会混入后续成果。
+            return {
+                "ok": False,
+                "message": f"事件解码失败：{exc}",
+                "failed_index": exc.index,
+                "config_name": str(cohort_config.get("群组名称", "")),
+            }
 
         self.run_action(config_id, "完成分析")
 

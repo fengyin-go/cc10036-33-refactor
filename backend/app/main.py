@@ -14,6 +14,7 @@ from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 from app.services import service_for
+from app.analytics_engine import events_fingerprint
 
 app = FastAPI(title="多维分析查询与指标平台", version="1.0.0")
 
@@ -118,13 +119,17 @@ def segment_pipeline(
         result = attribution_svc.compute_attribution_weights(int(model["id"]), _sample_touchpoints())
         attribution_results.append(result)
 
-    # Step 4: 缓存结果
-    cache_key = f"segment_pipeline_{rule_id}"
-    _ = cache_svc.get_or_compute(
-        "segment_pipeline", {"rule_id": rule_id},
-        compute_fn=lambda: {"segment": segment_result.get("matched_count"), "cohort": cohort_result},
-        ttl_seconds=600,
-    )
+    # Step 4: 缓存结果（缓存键含原始批次指纹：复跑同一批次才命中；
+    # 计算失败的批次不写入，避免两个批次的分子分母混进同一份成果）
+    cached = False
+    if cohort_result.get("ok"):
+        _ = cache_svc.get_or_compute(
+            "segment_pipeline",
+            {"rule_id": rule_id, "events_fingerprint": events_fingerprint(events)},
+            compute_fn=lambda: {"segment": segment_result.get("matched_count"), "cohort": cohort_result},
+            ttl_seconds=600,
+        )
+        cached = True
 
     return {
         "ok": True,
@@ -132,7 +137,7 @@ def segment_pipeline(
         "segment": segment_result,
         "cohort": cohort_result,
         "attribution": attribution_results,
-        "cached": True,
+        "cached": cached,
     }
 
 

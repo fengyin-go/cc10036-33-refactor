@@ -196,6 +196,123 @@ def segment_population(
 
 
 # ---------------------------------------------------------------------------
+# 事件解码：统一身份与时间字段
+# ---------------------------------------------------------------------------
+
+# 同一批分析允许两种输入格式：标准字段（user_id/event_name/event_time），
+# 或物理表原始字段（userId/event/ts，见语义层字段映射）。解码后即为同一来源。
+_IDENTITY_KEYS = ("user_id", "userId")
+_EVENT_NAME_KEYS = ("event_name", "event")
+_EVENT_TIME_KEYS = ("event_time", "ts")
+
+_ABSENT = object()
+
+
+class EventDecodeError(ValueError):
+    """事件解码失败：时间字段无法解释。携带批次内位置，便于定位与复跑。"""
+
+    def __init__(self, message: str, index: int = -1, raw_value: Any = None) -> None:
+        super().__init__(message)
+        self.index = index
+        self.raw_value = raw_value
+
+
+@dataclass
+class DecodedEvent:
+    """事件解码数据：共用的身份、事件名、时间字段 + 原始记录引用。
+
+    分群圈选与同期群分析都通过它读取同一批事件，保证两个模块口径一致。
+    """
+    user_id: str
+    event_name: str
+    event_time: float | None  # 非严格解码下时间缺失或失效记为 None
+    source: dict[str, Any]
+
+
+def _first_present(record: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in record:
+            return record[key]
+    return _ABSENT
+
+
+def decode_event_time(raw_value: Any, *, index: int = -1) -> float:
+    """把事件时间解码为 epoch 秒。
+
+    可解释的输入与既有口径一致（数值或数值字符串）；其余取值
+    （含 NaN/Inf）视为无法解释的时间，抛出 EventDecodeError。
+    """
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        raise EventDecodeError(
+            f"无法解释的事件时间：{raw_value!r}", index, raw_value,
+        ) from None
+    if not math.isfinite(value):
+        raise EventDecodeError(
+            f"无法解释的事件时间：{raw_value!r}", index, raw_value,
+        )
+    return value
+
+
+def decode_event(
+    record: dict[str, Any], index: int = 0, *, strict: bool = True,
+) -> DecodedEvent:
+    """解码单条事件记录：身份与事件名缺省为空串。
+
+    时间字段：strict=True 时缺省按 0 处理（沿用既有口径），无法解释立即失败；
+    strict=False 时缺失或失效都记为 None，供只读会员信息的圈选场景跳过。
+    """
+    identity = _first_present(record, _IDENTITY_KEYS)
+    name = _first_present(record, _EVENT_NAME_KEYS)
+    raw_time = _first_present(record, _EVENT_TIME_KEYS)
+    event_time: float | None
+    if raw_time is _ABSENT:
+        event_time = 0.0 if strict else None
+    else:
+        try:
+            event_time = decode_event_time(raw_time, index=index)
+        except EventDecodeError:
+            if strict:
+                raise
+            event_time = None
+    return DecodedEvent(
+        user_id="" if identity is _ABSENT else str(identity),
+        event_name="" if name is _ABSENT else str(name),
+        event_time=event_time,
+        source=record,
+    )
+
+
+def decode_events(
+    records: list[dict[str, Any]], *, strict: bool = True,
+) -> list[DecodedEvent]:
+    """按批次解码事件：严格模式下任何一条时间失效都让整批失败，不留半成品。"""
+    return [decode_event(r, i, strict=strict) for i, r in enumerate(records)]
+
+
+def events_fingerprint(events: list[dict[str, Any]]) -> str:
+    """按解码后的 (身份, 事件名, 时间) 计算批次指纹。
+
+    两种输入格式解码结果相同则指纹相同（同源）；复跑时据此核对是否仍是
+    同一原始批次，避免把两个批次的分子分母混进同一份成果。
+    """
+    digest = hashlib.md5()
+    for index, record in enumerate(events):
+        decoded = decode_event(record, index, strict=False)
+        if decoded.event_time is None:
+            # 时间缺失或失效的记录按原始取值参与指纹，避免不同的记录撞指纹
+            raw_time = _first_present(record, _EVENT_TIME_KEYS)
+            time_part = "<absent>" if raw_time is _ABSENT else repr(raw_time)
+        else:
+            time_part = repr(decoded.event_time)
+        digest.update(
+            f"{decoded.user_id}\x00{decoded.event_name}\x00{time_part}\x01".encode("utf-8")
+        )
+    return digest.hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
 # 同期群保留率计算
 # ---------------------------------------------------------------------------
 
@@ -217,16 +334,16 @@ def compute_cohort_retention(
     """计算同期群保留率矩阵。
 
     events: 每行 {user_id, event_name, event_time(epoch_seconds)}
+            或物理表格式 {userId, event, ts}；解码后两种格式口径一致。
+            时间无法解释的记录会让整批计算失败（EventDecodeError）。
     返回保留率矩阵（百分比 0-100）。
     """
-    # 按user分组事件
+    # 共用事件解码：身份与时间字段在此归一；严格模式保证失败批次不留半成品
     user_events: dict[str, list[tuple[str, float]]] = defaultdict(list)
-    for e in events:
-        uid = str(e.get("user_id", ""))
-        ename = str(e.get("event_name", ""))
-        etime = float(e.get("event_time", 0))
-        if uid:
-            user_events[uid].append((ename, etime))
+    for decoded in decode_events(events):
+        if decoded.user_id:
+            # 严格解码下 event_time 必为有效数值
+            user_events[decoded.user_id].append((decoded.event_name, decoded.event_time))
 
     # 为每个用户找到首次初始事件时间和回访事件时间
     user_cohorts: dict[str, float] = {}  # user -> first init time
